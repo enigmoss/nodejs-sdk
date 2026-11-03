@@ -1,0 +1,40 @@
+# enigmoss
+
+> Official TypeScript client of the Enigmoss Project API v4 (crypto payments, static wallets, payouts, refunds, transfers, webhooks). ESM, zero dependencies, Node.js 22.12+, Bun, Deno, Workers.
+
+## Setup
+- `import { Enigmoss, EnigmossError } from 'enigmoss'`
+- `new Enigmoss({ baseUrl, projectId, paymentKey?, payoutKey?, timeout?, maxRetries?, idempotency?, fetch? })`
+- `baseUrl` is the API host from the dashboard (e.g. `https://api.example.com`); the SDK appends `/api/v4`.
+- Payout key: payouts, refunds, transfers. Payment key: everything else and `webhooks.verify`. Reference data (`project`, `paymentMethods.list`, `payoutMethods`, `exchangeRates`) accepts either.
+
+## Rules
+- Money is a decimal string (`'10.50'`), never a number.
+- One `order_id`, one object: creates are idempotent by `order_id` (Idempotency-Key derived from it). Repeating a create with the same `order_id` returns the stored object.
+- If `error.outcomeUnknown` is true, the request may have been executed: never create a new `order_id`; reconcile with `list({ order_id })` or repeat with the same `order_id`.
+- Responses are the API body as is: `{ data, meta }`, snake_case. Lists return one page; next page: same call with `cursor: meta.cursor.next`.
+- Verify webhooks on the raw body bytes (Express: `express.raw({ type: 'application/json' })`); answer 400 on `webhook.invalid`. Deduplicate on `event_id`.
+
+## Methods (last optional argument: `{ timeout?, maxRetries?, idempotencyKey?, signal? }`)
+- payments: create(params), get(id), list(query?), cancel(id), markPaid(id), createAmlVerificationLinks(id)
+- wallets: create(params), get(id), list(query?), block(id, { refund_incoming? }?)
+- payouts: quote(params), create(params), get(id), list(query?)
+- refunds: createForPayment(paymentId, params), createForWallet(walletId, params), get(id), list(query?)
+- transfers: create(params), get(id), list(query?)
+- balances.list(), transactions.list(query?), project.get(), exchangeRates.list({ from? }?)
+- paymentMethods: list(), updateDiscount(currencyCode, networkCode, { discount_percent })
+- payoutMethods: list(), get(currencyCode, networkCode)
+- events: list(query?), get(id), redeliver(id), redeliverBulk({ created_from, ... })
+- webhooks: sendTest({ callback_url? }?), verify(rawBody, headers) → `{ event, event_id, created_at, data }`
+- request(method, path, { query?, body? }?, options?) for any other endpoint; `path` is after `/api/v4`.
+
+## EnigmossError (the only error class)
+- `code`: server code (`'payout.insufficient_funds'`, `'validation.failed'`, …), `'http.<status>'`, or `'network'`, `'timeout'`, `'aborted'`, `'response.invalid'`, `'webhook.invalid'`, `'config'`. Branch on it, not on the message.
+- `status`: HTTP status or null. `requestId`: quote to support. `body`: response body as received. `cause`.
+- `outcomeUnknown`: true after a connection lost after sending, a timeout or abort, HTTP 5xx, `idempotency.in_progress`, or an unreadable 2xx body.
+
+## Retries (maxRetries, default 2; 0 disables)
+- Reads and `payouts.quote`: network errors, 429, 502–504. Backoff 0.5–8 s with jitter; Retry-After up to 10 s.
+- Money POSTs: only if not sent, sent with an Idempotency-Key, or on rate_limit.exceeded, lock.not_acquired, idempotency.in_progress, dependency.unavailable. Business errors never.
+- `idempotency: false`: no key from `order_id`; a random key only where the server requires one; money POSTs not retried once sent.
+- Payout and refund creation: attempt timeout at least 180 s (the gateway answers in up to ~160 s).
