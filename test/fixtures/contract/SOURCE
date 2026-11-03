@@ -1,0 +1,3 @@
+Copied from the PHP SDK (enigmoss-php), tests/Fixtures/contract, commit 77db21a.
+Contract revision of the signature vectors: 5c7c8e6a.
+Never edit these files by hand; refresh them from the shared contract.
