@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Official TypeScript client of the Enigmoss Project API v4: payments, wallets, payouts, refunds, transfers, webhooks.",
   "license": "MIT",
+  "homepage": "https://github.com/enigmoss/nodejs-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/enigmoss/nodejs-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/enigmoss/nodejs-sdk/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "exports": {
