@@ -1,6 +1,6 @@
 import { EnigmossError } from '../error.js';
 import { VERSION } from '../version.js';
-import { concat, hmacKey, orderIdempotencyKey, rawUrlEncode, signRequest, unhex, utf8 } from './crypto.js';
+import { concat, hex, hmacKey, orderIdempotencyKey, rawUrlEncode, signRequest, unhex, utf8 } from './crypto.js';
 import {
   acceptOrigin,
   FALLBACK_PAUSE,
@@ -315,6 +315,11 @@ export class Transport {
   /**
    * Asks the fallback host for the API origin: a signed GET of the platform brand, sent past the
    * retry loop. The answer counts only when it is signed with the key that signed the request.
+   *
+   * Every probe request carries a one-time nonce in its signed URI. The response signature covers
+   * the request signature, so an answer fits the one request it was given to: without the nonce
+   * the request signature would depend on the second alone, and the clock correction below takes
+   * that second from an unsigned `server_time`, which would let a recorded answer be replayed.
    */
   private async probe(deadline: number): Promise<Probe> {
     const { config } = this;
@@ -323,13 +328,14 @@ export class Transport {
     let offset = 0;
     for (let corrected = false; ; corrected = true) {
       const timestamp = Math.floor(Date.now() / 1000) + offset;
-      const signature = await signRequest(key, timestamp, config.projectId, 'GET', PROBE_URI, new Uint8Array());
+      const requestUri = `${PROBE_URI}?nonce=${hex(crypto.getRandomValues(new Uint8Array(16)).buffer)}`;
+      const signature = await signRequest(key, timestamp, config.projectId, 'GET', requestUri, new Uint8Array());
 
       let response: Response;
       let bytes: Uint8Array<ArrayBuffer>;
       try {
         const send = config.fetch;
-        response = await send(`${config.fallbackOrigin}${PROBE_URI}`, {
+        response = await send(`${config.fallbackOrigin}${requestUri}`, {
           method: 'GET',
           headers: {
             Accept: 'application/json',

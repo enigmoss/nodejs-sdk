@@ -8,7 +8,9 @@ export const ORIGIN = 'https://api.example.com';
 /** The fallback host of the fallback tests and the origin it names. */
 export const FALLBACK = 'https://api.example.org';
 export const MOVED = 'https://api2.example.com';
+/** Path of the probe of a fallback host; the request adds `?nonce=<32 hex>`. */
 export const PROBE_URI = '/api/v4/project/platform-brand';
+export const PROBE = /^\/api\/v4\/project\/platform-brand\?nonce=([0-9a-f]{32})$/;
 
 export interface Sent {
   readonly method: string;
@@ -167,6 +169,15 @@ export function lostAfterSend(): Error {
   return Object.assign(new TypeError('fetch failed'), {
     cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
   });
+}
+
+/** The one-time nonce of a probe request; fails when the request is not a probe. */
+export function nonce(request: Sent): string {
+  const match = PROBE.exec(request.uri);
+  if (match === null) {
+    throw new Error(`not a probe: ${request.uri}`);
+  }
+  return match[1] as string;
 }
 
 /** Independent reference implementation of the request signature, on node:crypto. */

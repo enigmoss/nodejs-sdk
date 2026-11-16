@@ -1,4 +1,4 @@
-/** Request URI of the probe sent to the fallback host. */
+/** Path of the probe sent to the fallback host; every probe adds a one-time `nonce` as its query. */
 export const PROBE_URI = '/api/v4/project/platform-brand';
 
 /** Timeout of the probe, ms: it runs after the retries failed and must not double the wait. */

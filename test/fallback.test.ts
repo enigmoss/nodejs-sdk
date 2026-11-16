@@ -15,10 +15,12 @@ import {
   json,
   lostAfterSend,
   MOVED,
+  nonce,
   notSent,
   ORIGIN,
   PAYMENT_KEY,
   PAYOUT_KEY,
+  PROBE,
   PROBE_URI,
   PROJECT,
   type Reply,
@@ -81,7 +83,7 @@ describe('when the API host cannot be reached', () => {
       `${ORIGIN}/api/v4/payments/p-1`,
       `${ORIGIN}/api/v4/payments/p-1`,
       `${ORIGIN}/api/v4/payments/p-1`,
-      `${FALLBACK}${PROBE_URI}`,
+      `${FALLBACK}${PROBE_URI}?nonce=${nonce(sent[3] as Sent)}`,
       `${MOVED}/api/v4/payments/p-1`,
     ]);
 
@@ -102,7 +104,9 @@ describe('when the API host cannot be reached', () => {
     const { enigmoss, to } = setup({ [ORIGIN]: down, [FALLBACK]: names(MOVED), [MOVED]: () => ok() });
     await enigmoss.payouts.create(PAYOUT);
     const probe = to(FALLBACK)[0] as Sent;
-    expect(probe).toMatchObject({ method: 'GET', uri: PROBE_URI, body: null });
+    expect(probe).toMatchObject({ method: 'GET', body: null });
+    // A one-time nonce is the whole query, and it is signed with the path.
+    expect(probe.uri).toMatch(PROBE);
     expect(Object.keys(probe.headers).sort()).toEqual([
       'Accept',
       'User-Agent',
@@ -112,7 +116,8 @@ describe('when the API host cannot be reached', () => {
     ]);
     expect(probe.headers['X-Project-Uuid']).toBe(PROJECT);
     // Either key reads the platform brand: the payment key when both are set.
-    expect(probe.headers['X-Signature']).toBe(expectedSignature(PAYMENT_KEY, probe.headers, 'GET', PROBE_URI, ''));
+    expect(probe.headers['X-Signature']).toBe(expectedSignature(PAYMENT_KEY, probe.headers, 'GET', probe.uri, ''));
+    expect(probe.headers['X-Signature']).not.toBe(expectedSignature(PAYMENT_KEY, probe.headers, 'GET', PROBE_URI, ''));
   });
 
   it('signs the probe with the payout key when it is the only one', async () => {
@@ -122,7 +127,7 @@ describe('when the API host cannot be reached', () => {
     );
     await enigmoss.payouts.create(PAYOUT);
     const probe = to(FALLBACK)[0] as Sent;
-    expect(probe.headers['X-Signature']).toBe(expectedSignature(PAYOUT_KEY, probe.headers, 'GET', PROBE_URI, ''));
+    expect(probe.headers['X-Signature']).toBe(expectedSignature(PAYOUT_KEY, probe.headers, 'GET', probe.uri, ''));
     expect(to(MOVED)).toHaveLength(1);
   });
 
@@ -251,6 +256,14 @@ describe('an answer of the fallback host that is not a new origin', () => {
       'https://api2.example.com#top',
       'https://api2.example.com.',
       ' https://api2.example.com',
+      'https://api2.example.com ',
+      'https://api2.example.com\n',
+      'https://api2.example.com\r\n',
+      'https://api2.example.com\u2028',
+      '\nhttps://api2.example.com',
+      'https://api2.example.com\nhttps://api3.example.com',
+      'https://api2.example.com:443\n',
+      'https://api2.example.com\u0000',
       'https://api2 .example.com',
       'ftp://api2.example.com',
       '//api2.example.com',
@@ -608,6 +621,81 @@ describe('concurrent calls', () => {
   });
 });
 
+describe('the one-time nonce of the probe', () => {
+  it('differs between probes, so does the signature within one second', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const net = fakeHosts({ [ORIGIN]: down, [FALLBACK]: () => apiError(503, 'dependency.unavailable') });
+    // Two clients: the second one is not held back by the pause of the first.
+    for (const _ of [1, 2]) {
+      await fails(client(net.fetch, { fallbackBaseUrl: FALLBACK }).payments.get('p-1'));
+    }
+    const [first, second] = net.to(FALLBACK) as [Sent, Sent];
+    expect(net.to(FALLBACK)).toHaveLength(2);
+    expect(second.headers['X-Timestamp']).toBe(first.headers['X-Timestamp']);
+    expect(nonce(second)).not.toBe(nonce(first));
+    expect(second.headers['X-Signature']).not.toBe(first.headers['X-Signature']);
+  });
+
+  it('ties an answer to its request: a recorded answer of the same second is rejected', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    // The fallback host keeps the first genuine answer and replays it to every later probe.
+    let recorded: { text: string; headers: Headers } | undefined;
+    const net = fakeHosts({
+      [ORIGIN]: down,
+      [FALLBACK]: async (request) => {
+        if (recorded === undefined) {
+          const genuine = brand(request, MOVED);
+          recorded = { text: await genuine.text(), headers: genuine.headers };
+        }
+        return new Response(recorded.text, { status: 200, headers: recorded.headers });
+      },
+      [MOVED]: () => ok(),
+    });
+
+    await expect(client(net.fetch, { fallbackBaseUrl: FALLBACK }).payments.get('p-1')).resolves.toEqual({
+      data: { id: 'x' },
+    });
+    const replayed = await fails(client(net.fetch, { fallbackBaseUrl: FALLBACK }).payments.get('p-1'));
+
+    const [first, second] = net.to(FALLBACK) as [Sent, Sent];
+    // Same key, same second, same path: only the nonce tells the two requests apart.
+    expect(second.headers['X-Timestamp']).toBe(first.headers['X-Timestamp']);
+    expect(replayed).toMatchObject({ code: 'response.invalid', status: 200 });
+    expect(replayed.message).toContain('X-Response-Signature does not match');
+    expect(net.to(MOVED)).toHaveLength(1);
+  });
+
+  it('ties an answer to its request after a clock correction too', async () => {
+    // The host shifts the client clock to the moment of a recorded answer, then replays it.
+    const recordedAt = Math.floor(Date.now() / 1000) - 7_200;
+    const net = fakeHosts({
+      [ORIGIN]: down,
+      [FALLBACK]: (request) => {
+        if (Math.abs(Number(request.headers['X-Timestamp']) - recordedAt) > 5) {
+          return json(401, {
+            error: {
+              code: 'auth.timestamp_expired',
+              message: 'Timestamp expired.',
+              details: { server_time: recordedAt },
+            },
+            meta: { request_id: 'req-1' },
+          });
+        }
+        // Signed for the same timestamp and path, but for the request of another nonce.
+        const other = { ...request, uri: `${PROBE_URI}?nonce=${'0'.repeat(32)}` };
+        const signature = expectedSignature(PAYMENT_KEY, request.headers, 'GET', other.uri, '');
+        return brand({ ...other, headers: { 'X-Signature': signature } }, MOVED, { timestamp: recordedAt });
+      },
+      [MOVED]: () => ok(),
+    });
+    const error = await fails(client(net.fetch, { fallbackBaseUrl: FALLBACK }).payments.get('p-1'));
+    expect(error).toMatchObject({ code: 'response.invalid', status: 200 });
+    expect(error.message).toContain('X-Response-Signature does not match');
+    expect(net.to(FALLBACK)).toHaveLength(2);
+    expect(net.to(MOVED)).toHaveLength(0);
+  });
+});
+
 describe('a wrong local clock', () => {
   const expired = (serverTime: number) =>
     json(401, {
@@ -634,7 +722,10 @@ describe('a wrong local clock', () => {
     const [first, second] = to(FALLBACK) as [Sent, Sent];
     expect(to(FALLBACK)).toHaveLength(2);
     expect(Number(second.headers['X-Timestamp']) - Number(first.headers['X-Timestamp'])).toBeGreaterThanOrEqual(3_599);
-    expect(second.headers['X-Signature']).toBe(expectedSignature(PAYMENT_KEY, second.headers, 'GET', PROBE_URI, ''));
+    // The repeat is another request: a new nonce, hence a new signature.
+    expect(nonce(second)).not.toBe(nonce(first));
+    expect(second.headers['X-Signature']).not.toBe(first.headers['X-Signature']);
+    expect(second.headers['X-Signature']).toBe(expectedSignature(PAYMENT_KEY, second.headers, 'GET', second.uri, ''));
   });
 
   it('is not corrected twice', async () => {
@@ -696,7 +787,19 @@ describe('fallback options', () => {
       { fallbackBaseUrl: 'https://API.example.org/api/v4/' },
     );
     await enigmoss.payments.get('p-1');
-    expect(to(FALLBACK)[0]?.url).toBe(`${FALLBACK}${PROBE_URI}`);
+    expect(to(FALLBACK)[0]?.url).toBe(`${FALLBACK}${PROBE_URI}?nonce=${nonce(to(FALLBACK)[0] as Sent)}`);
+  });
+
+  it('rejects trailing junk after a loopback http origin', async () => {
+    const primary = 'http://localhost:8080';
+    const fallback = 'http://127.0.0.1:8081';
+    for (const origin of ['http://localhost:8082\n', 'http://localhost:8082/', 'http://localhost:8082 ']) {
+      const { enigmoss } = setup(
+        { [primary]: down, [fallback]: names(origin) },
+        { baseUrl: primary, fallbackBaseUrl: fallback },
+      );
+      expect(await fails(enigmoss.payments.get('p-1'))).toMatchObject({ code: 'response.invalid' });
+    }
   });
 
   it('accepts a loopback http origin only from a loopback http fallback host', async () => {
@@ -757,7 +860,7 @@ describe('over real sockets', () => {
       await expect(enigmoss.payments.get('p-1')).resolves.toEqual({ data: { id: 'x' } });
       await expect(enigmoss.payments.get('p-2')).resolves.toEqual({ data: { id: 'x' } });
       expect(seen).toEqual([
-        `fallback GET ${PROBE_URI}`,
+        expect.stringMatching(/^fallback GET \/api\/v4\/project\/platform-brand\?nonce=[0-9a-f]{32}$/),
         'api GET /api/v4/payments/p-1',
         'api GET /api/v4/payments/p-2',
       ]);
