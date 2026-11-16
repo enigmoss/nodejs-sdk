@@ -4,7 +4,7 @@
 
 ## Setup
 - `import { Enigmoss, EnigmossError } from 'enigmoss'`
-- `new Enigmoss({ baseUrl, projectId, paymentKey?, payoutKey?, timeout?, maxRetries?, idempotency?, fetch? })`
+- `new Enigmoss({ baseUrl, projectId, paymentKey?, payoutKey?, timeout?, maxRetries?, idempotency?, fetch?, fallbackBaseUrl?, onOriginChange? })`
 - `baseUrl` is the API host from the dashboard (e.g. `https://api.example.com`); the SDK appends `/api/v4`.
 - Payout key: payouts, refunds, transfers. Payment key: everything else and `webhooks.verify`. Reference data (`project`, `paymentMethods.list`, `payoutMethods`, `exchangeRates`) accepts either.
 
@@ -38,3 +38,10 @@
 - Money POSTs: only if not sent, sent with an Idempotency-Key, or on rate_limit.exceeded, lock.not_acquired, idempotency.in_progress, dependency.unavailable. Business errors never.
 - `idempotency: false`: no key from `order_id`; a random key only where the server requires one; money POSTs not retried once sent.
 - Payout and refund creation: attempt timeout at least 180 s (the gateway answers in up to ~160 s).
+
+## Fallback host (`fallbackBaseUrl`, off by default)
+- Order: retries on the current origin first; the fallback only when they are used up and the last attempt never connected to the API host (DNS, refused connection, TLS handshake, connect timeout). Never after a response timeout, a connection lost after sending, an abort or any HTTP response.
+- The client sends one signed `GET /api/v4/project/platform-brand` to `fallbackBaseUrl` (3 s), accepts `data.api.origin` only from an answer signed with the request key (`X-Response-Signature`) that names an https origin of a public host, and repeats the call there with the same body and Idempotency-Key. Attempts start over, the time budget of the call does not.
+- The new origin is kept in the client instance for `refresh_after` seconds (1 hour to 7 days), then `baseUrl` is used again. `onOriginChange({ previous, current, expiresAt })` reports the move.
+- Fallback host answered with an error or an untrusted answer: that error is thrown (`code`/`status` of the answer, `'response.invalid'` for a 2xx), `cause` is the network error; `outcomeUnknown` still describes the original call. Same origin or fallback host unreachable: the original network error. Then no new fallback for 5 minutes.
+- Concurrent calls share one probe; one fallback per call. Needs an error code in the `cause` chain of the fetch failure (Node.js, Bun); a bare `TypeError` never starts it.
