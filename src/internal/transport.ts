@@ -1,6 +1,16 @@
 import { EnigmossError } from '../error.js';
 import { VERSION } from '../version.js';
-import { hmacKey, orderIdempotencyKey, rawUrlEncode, signRequest, utf8 } from './crypto.js';
+import { concat, hmacKey, orderIdempotencyKey, rawUrlEncode, signRequest, unhex, utf8 } from './crypto.js';
+import {
+  acceptOrigin,
+  FALLBACK_PAUSE,
+  MAX_CLOCK_DRIFT,
+  MIN_CLOCK_DRIFT,
+  originLifetime,
+  PROBE_TIMEOUT,
+  PROBE_URI,
+  RESPONSE_TOLERANCE,
+} from './origin.js';
 
 export const API_PREFIX = '/api/v4';
 
@@ -52,8 +62,21 @@ export interface Call {
   readonly body?: object | undefined;
 }
 
+/** Argument of the `onOriginChange` option: the client moved to another API origin. */
+export interface OriginChange {
+  /** The origin the requests could not reach. */
+  readonly previous: string;
+  /** The origin the client sends to from now on. */
+  readonly current: string;
+  /** When the client goes back to `baseUrl`. */
+  readonly expiresAt: Date;
+}
+
 export interface TransportConfig {
   readonly origin: string;
+  /** Origin of the fallback host; `undefined` turns the fallback off. */
+  readonly fallbackOrigin: string | undefined;
+  readonly onOriginChange: ((change: OriginChange) => void) | undefined;
   readonly projectId: string;
   readonly paymentKey: string | undefined;
   readonly payoutKey: string | undefined;
@@ -103,11 +126,26 @@ interface Failure {
   readonly error: EnigmossError;
   /** Delay before the next attempt in ms, `'backoff'`, or `null` when the error must be thrown. */
   readonly delay: number | 'backoff' | null;
+  /** The connection to the API host was certainly never established: the only failure a fallback answers. */
+  readonly unreachable?: boolean;
 }
+
+/** What the fallback host answered to the probe. */
+type Probe =
+  | { readonly kind: 'origin'; readonly origin: string; readonly lifetime: number; readonly body: unknown }
+  | { readonly kind: 'unreachable' }
+  | { readonly kind: 'failed'; readonly error: (cause: EnigmossError) => EnigmossError };
 
 /** Builds, signs and sends requests; retries them safely. */
 export class Transport {
   private readonly keys = new Map<string, Promise<CryptoKey>>();
+
+  /** The origin a fallback host named and the time (ms) until which it replaces `config.origin`. */
+  private moved: { readonly origin: string; readonly expiresAt: number } | null = null;
+  /** No fallback is tried before this time (ms): the last one did not move the client. */
+  private pausedUntil = 0;
+  /** The probe in flight: concurrent calls wait for it instead of sending their own. */
+  private flight: Promise<Probe> | null = null;
 
   constructor(private readonly config: TransportConfig) {}
 
@@ -124,7 +162,14 @@ export class Transport {
     const protectedByKey = idempotencyKey !== null && (options.idempotencyKey !== undefined || config.idempotency);
     const maxRetries = Math.max(0, options.maxRetries ?? config.maxRetries);
     const timeout = options.timeout ?? Math.max(config.timeout, endpoint.minTimeout ?? 0);
+    // Only a client with a fallback host has a time budget: the probe and the retries after a move must fit in it.
+    const deadline =
+      config.fallbackOrigin === undefined
+        ? Number.POSITIVE_INFINITY
+        : Date.now() + timeout * (maxRetries + 1) + MAX_RETRY_AFTER * 1000 * maxRetries;
 
+    let origin = this.activeOrigin();
+    let moved = false;
     let unknownBefore: EnigmossError | null = null;
     for (let attempt = 1; ; attempt++) {
       const timestamp = Math.floor(Date.now() / 1000);
@@ -151,6 +196,7 @@ export class Transport {
 
       const outcome = await this.attempt<T>(
         endpoint,
+        origin,
         requestUri,
         headers,
         body,
@@ -163,19 +209,238 @@ export class Transport {
       }
 
       const { error, delay } = outcome;
-      if (delay === null || attempt > maxRetries || options.signal?.aborted) {
+      const last = delay === null || attempt > maxRetries || options.signal?.aborted;
+      const wait = last || delay === null ? 0 : delay === 'backoff' ? backoff(attempt) : delay;
+      // After a move the call keeps its deadline: no retry starts past it.
+      if (last || (moved && Date.now() + wait >= deadline)) {
         // A retry answered "not executed" says nothing about an earlier attempt that may have run.
-        throw unknownBefore !== null && !error.outcomeUnknown ? withUnknownOutcome(error, unknownBefore) : error;
+        const thrown =
+          unknownBefore !== null && !error.outcomeUnknown ? withUnknownOutcome(error, unknownBefore) : error;
+        if (config.fallbackOrigin !== undefined && outcome.unreachable && !moved && !options.signal?.aborted) {
+          const next = await this.fallback(origin, deadline, thrown, options.signal);
+          if (next !== null && method === 'GET' && requestUri === PROBE_URI && next.body !== undefined) {
+            // The call asked for what the probe has just fetched.
+            return next.body as T;
+          }
+          if (next !== null && next.origin !== origin) {
+            // The same body and Idempotency-Key go to the new origin; the attempts start over.
+            origin = next.origin;
+            moved = true;
+            attempt = 0;
+            continue;
+          }
+        }
+        throw thrown;
       }
       if (error.outcomeUnknown) {
         unknownBefore ??= error;
       }
-      await sleep(delay === 'backoff' ? backoff(attempt) : delay, options.signal);
+      await sleep(wait, options.signal);
+    }
+  }
+
+  /** The origin to send to: the one a fallback host named, until it expires, else `baseUrl`. */
+  private activeOrigin(): string {
+    const { moved } = this;
+    if (moved !== null) {
+      if (Date.now() < moved.expiresAt) {
+        return moved.origin;
+      }
+      this.moved = null;
+    }
+    return this.config.origin;
+  }
+
+  /**
+   * Runs once per call, after the retries, when `failed` could not be reached. Resolves with the
+   * origin to continue on (and the probe response, when a probe ran), or `null` when the call fails
+   * with its own error; rejects with the error of the fallback host, `cause` attached.
+   */
+  private async fallback(
+    failed: string,
+    deadline: number,
+    cause: EnigmossError,
+    signal: AbortSignal | undefined,
+  ): Promise<{ origin: string; body?: unknown } | null> {
+    if (this.config.fallbackOrigin === undefined || deadline - Date.now() < PROBE_TIMEOUT) {
+      return null;
+    }
+    let flight = this.flight;
+    if (flight === null) {
+      const active = this.activeOrigin();
+      if (active !== failed) {
+        // Another call has moved the client while this one was retrying.
+        return { origin: active };
+      }
+      if (Date.now() < this.pausedUntil) {
+        return null;
+      }
+      const started = this.relocate(failed, deadline);
+      flight = started;
+      this.flight = started;
+      void started.then(() => {
+        if (this.flight === started) {
+          this.flight = null;
+        }
+      });
+    }
+    const probe = await abortable(flight, signal);
+    if (probe.kind === 'failed') {
+      throw probe.error(cause);
+    }
+    return probe.kind === 'origin' ? { origin: probe.origin, body: probe.body } : null;
+  }
+
+  /** One shared probe and its bookkeeping: a new origin is remembered, anything else starts the pause. */
+  private async relocate(failed: string, deadline: number): Promise<Probe> {
+    let probe: Probe;
+    try {
+      probe = await this.probe(deadline);
+    } catch {
+      probe = { kind: 'unreachable' };
+    }
+    const now = Date.now();
+    if (probe.kind === 'origin' && probe.origin !== failed) {
+      const expiresAt = now + probe.lifetime * 1000;
+      this.moved = { origin: probe.origin, expiresAt };
+      this.pausedUntil = 0;
+      this.notify({ previous: failed, current: probe.origin, expiresAt: new Date(expiresAt) });
+    } else {
+      // Only the time is kept, never the answer: a call during the pause fails with its own error.
+      this.pausedUntil = now + FALLBACK_PAUSE;
+    }
+    return probe;
+  }
+
+  /**
+   * Asks the fallback host for the API origin: a signed GET of the platform brand, sent past the
+   * retry loop. The answer counts only when it is signed with the key that signed the request.
+   */
+  private async probe(deadline: number): Promise<Probe> {
+    const { config } = this;
+    const key = await this.key('any', 'GET', PROBE_URI);
+    // The probe corrects a wrong local clock once, for itself: seconds added to the local time.
+    let offset = 0;
+    for (let corrected = false; ; corrected = true) {
+      const timestamp = Math.floor(Date.now() / 1000) + offset;
+      const signature = await signRequest(key, timestamp, config.projectId, 'GET', PROBE_URI, new Uint8Array());
+
+      let response: Response;
+      let bytes: Uint8Array<ArrayBuffer>;
+      try {
+        const send = config.fetch;
+        response = await send(`${config.fallbackOrigin}${PROBE_URI}`, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': USER_AGENT,
+            'X-Project-Uuid': config.projectId,
+            'X-Timestamp': String(timestamp),
+            'X-Signature': signature,
+          },
+          body: null,
+          redirect: 'manual',
+          signal: AbortSignal.timeout(PROBE_TIMEOUT),
+        });
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch {
+        return { kind: 'unreachable' };
+      }
+      const text = new TextDecoder().decode(bytes);
+      const status = response.status;
+
+      if (status < 200 || status >= 300) {
+        const failure = readError(response, text);
+        const serverTime = failure.details.server_time;
+        if (
+          !corrected &&
+          failure.code === 'auth.timestamp_expired' &&
+          typeof serverTime === 'number' &&
+          Number.isInteger(serverTime) &&
+          deadline - Date.now() >= PROBE_TIMEOUT
+        ) {
+          const drift = serverTime - Math.floor(Date.now() / 1000);
+          if (Math.abs(drift) >= MIN_CLOCK_DRIFT) {
+            offset = Math.max(-MAX_CLOCK_DRIFT, Math.min(MAX_CLOCK_DRIFT, drift));
+            continue;
+          }
+        }
+        return {
+          kind: 'failed',
+          error: (cause) =>
+            new EnigmossError(`The fallback API host answered with an error: ${failure.message}`, {
+              code: failure.code,
+              status,
+              // The call's own request never left: only its earlier attempts decide the outcome.
+              outcomeUnknown: cause.outcomeUnknown,
+              requestId: failure.requestId,
+              body: failure.body,
+              cause,
+            }),
+        };
+      }
+
+      let parsed: unknown;
+      const distrusted = (reason: string): Probe => ({
+        kind: 'failed',
+        error: (cause) =>
+          new EnigmossError(`The fallback API host sent an answer the SDK does not trust: ${reason}`, {
+            code: 'response.invalid',
+            status,
+            outcomeUnknown: cause.outcomeUnknown,
+            requestId: response.headers.get('X-Request-Id'),
+            body: parsed === undefined ? text : parsed,
+            cause,
+          }),
+      });
+
+      const stamp = response.headers.get('X-Response-Timestamp') ?? '';
+      const mac = unhex(response.headers.get('X-Response-Signature') ?? '');
+      if (!/^\d{1,12}$/.test(stamp) || mac === null || mac.length !== 32) {
+        return distrusted('X-Response-Timestamp or X-Response-Signature is missing or malformed.');
+      }
+      if (Math.abs(Number(stamp) - (Math.floor(Date.now() / 1000) + offset)) > RESPONSE_TOLERANCE) {
+        return distrusted(`X-Response-Timestamp is more than ${RESPONSE_TOLERANCE} s away from the local clock.`);
+      }
+      // hex(HMAC-SHA256(key, "{X-Response-Timestamp}\n{X-Signature of the request}\n{body}")), compared in constant time.
+      if (!(await crypto.subtle.verify('HMAC', key, mac, concat(utf8(`${stamp}\n${signature}\n`), bytes)))) {
+        return distrusted('X-Response-Signature does not match the key of the request.');
+      }
+
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return distrusted('the body is not valid JSON.');
+      }
+      const data = isObject(parsed) && isObject(parsed.data) ? parsed.data : {};
+      const api = isObject(data.api) ? data.api : {};
+      if (typeof api.origin !== 'string') {
+        return distrusted('it has no data.api.origin.');
+      }
+      const origin = acceptOrigin(api.origin, (config.fallbackOrigin ?? '').startsWith('http://'));
+      if (origin === null) {
+        return distrusted('data.api.origin is not an https origin of a public host.');
+      }
+      return { kind: 'origin', origin, lifetime: originLifetime(data.refresh_after), body: parsed };
+    }
+  }
+
+  private notify(change: OriginChange): void {
+    const listener = this.config.onOriginChange;
+    if (listener === undefined) {
+      return;
+    }
+    try {
+      // A listener never breaks an API call, an async one that rejects included.
+      void Promise.resolve(listener(change)).catch(() => {});
+    } catch {
+      // Ignored for the same reason.
     }
   }
 
   private async attempt<T>(
     endpoint: Endpoint,
+    origin: string,
     requestUri: string,
     headers: Record<string, string>,
     body: Uint8Array<ArrayBuffer> | null,
@@ -196,7 +461,7 @@ export class Transport {
     let text: string;
     try {
       const send = this.config.fetch;
-      response = await send(`${this.config.origin}${requestUri}`, init);
+      response = await send(`${origin}${requestUri}`, init);
       text = await response.text();
     } catch (cause) {
       return transportFailure(endpoint.retry, protectedByKey, cause, timer, signal);
@@ -272,10 +537,7 @@ function transportFailure(
   signal: AbortSignal | undefined,
 ): Failure {
   if (signal?.aborted) {
-    return {
-      error: new EnigmossError('The request was aborted.', { code: 'aborted', outcomeUnknown: true, cause }),
-      delay: null,
-    };
+    return { error: aborted(cause), delay: null };
   }
   if (timer.aborted) {
     const error = new EnigmossError('The request timed out; it may have been executed.', {
@@ -294,10 +556,25 @@ function transportFailure(
     { code: 'network', outcomeUnknown: !notSent, cause },
   );
   const retryable = notSent || retry === 'read' || (retry === 'money' && protectedByKey);
-  return { error, delay: retryable ? 'backoff' : null };
+  return { error, delay: retryable ? 'backoff' : null, unreachable: notSent };
 }
 
-function errorResponse(retry: RetryClass, protectedByKey: boolean, response: Response, text: string): Failure {
+/** An error response as the SDK reads it. */
+interface ErrorBody {
+  /** Parsed JSON, or the raw text when the body is not JSON. */
+  readonly body: unknown;
+  /** `error.code` of the API error body, else `http.<status>`. */
+  readonly code: string;
+  readonly hasEnvelope: boolean;
+  readonly requestId: string | null;
+  /** Seconds from `meta.retry_after` or the Retry-After header. */
+  readonly retryAfter: number | null;
+  readonly details: Record<string, unknown>;
+  /** "<server message> [<code>, request <id>]". */
+  readonly message: string;
+}
+
+function readError(response: Response, text: string): ErrorBody {
   const status = response.status;
   let body: unknown = text;
   try {
@@ -320,7 +597,21 @@ function errorResponse(retry: RetryClass, protectedByKey: boolean, response: Res
       : null;
 
   const message = typeof error.message === 'string' ? error.message : `HTTP ${status} from the API host.`;
-  const enigmossError = new EnigmossError(`${message} [${code}${requestId === null ? '' : `, request ${requestId}`}]`, {
+  return {
+    body,
+    code,
+    hasEnvelope,
+    requestId,
+    retryAfter,
+    details: isObject(error.details) ? error.details : {},
+    message: `${message} [${code}${requestId === null ? '' : `, request ${requestId}`}]`,
+  };
+}
+
+function errorResponse(retry: RetryClass, protectedByKey: boolean, response: Response, text: string): Failure {
+  const status = response.status;
+  const { body, code, hasEnvelope, requestId, retryAfter, message } = readError(response, text);
+  const enigmossError = new EnigmossError(message, {
     code,
     status,
     outcomeUnknown: status >= 500 || code === 'idempotency.in_progress',
@@ -362,15 +653,42 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer);
-      reject(
-        new EnigmossError('The request was aborted.', { code: 'aborted', outcomeUnknown: true, cause: signal?.reason }),
-      );
+      reject(aborted(signal?.reason));
     };
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function aborted(cause: unknown): EnigmossError {
+  return new EnigmossError('The request was aborted.', { code: 'aborted', outcomeUnknown: true, cause });
+}
+
+/** Waits for a result several calls share: an abort ends the caller's wait, not the shared work. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(aborted(signal.reason));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
   });
 }
 

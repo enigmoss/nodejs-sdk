@@ -1,5 +1,11 @@
 import { EnigmossError } from './error.js';
-import { API_PREFIX, type QueryValue, type RequestOptions, Transport } from './internal/transport.js';
+import {
+  API_PREFIX,
+  type OriginChange,
+  type QueryValue,
+  type RequestOptions,
+  Transport,
+} from './internal/transport.js';
 import {
   Balances,
   Events,
@@ -37,6 +43,15 @@ export interface EnigmossOptions {
   idempotency?: boolean;
   /** Custom fetch (proxy, tests). Default: the global `fetch`. */
   fetch?: typeof fetch;
+  /**
+   * A second API host, asked where the API lives now when `baseUrl` cannot be reached: after the
+   * retries, and only when no connection to the API host was established. The client then repeats
+   * the call on the origin that host names and keeps using it for a while. No default: without
+   * this option nothing changes.
+   */
+  fallbackBaseUrl?: string | undefined;
+  /** Called each time the client moves to another API origin. An error it throws is ignored. */
+  onOriginChange?: ((change: OriginChange) => void) | undefined;
 }
 
 /** Parameters of `request()`. */
@@ -85,11 +100,18 @@ export class Enigmoss {
     if (typeof (options.fetch ?? globalThis.fetch) !== 'function') {
       throw config('No global fetch in this runtime: pass the fetch option.');
     }
+    if (options.onOriginChange !== undefined && typeof options.onOriginChange !== 'function') {
+      throw config('onOriginChange must be a function.');
+    }
 
     const projectId = options.projectId.trim();
     const paymentKey = options.paymentKey || undefined;
+    // An empty value is "not set": the option is usually read from the environment.
+    const fallback = String(options.fallbackBaseUrl ?? '').trim();
     this.transport = new Transport({
-      origin: origin(options.baseUrl),
+      origin: origin(options.baseUrl, 'baseUrl'),
+      fallbackOrigin: fallback === '' ? undefined : origin(fallback, 'fallbackBaseUrl'),
+      onOriginChange: options.onOriginChange,
       projectId,
       paymentKey,
       payoutKey: options.payoutKey || undefined,
@@ -140,24 +162,27 @@ export class Enigmoss {
   }
 }
 
-/** Normalizes the base URL to an origin. https only, except loopback hosts for local development. */
-function origin(baseUrl: string): string {
+/**
+ * Normalizes a base URL (the `option` of that name) to an origin. https only, except loopback hosts
+ * for local development.
+ */
+function origin(baseUrl: string, option: 'baseUrl' | 'fallbackBaseUrl'): string {
   let url: URL;
   try {
     url = new URL(String(baseUrl).trim());
   } catch {
-    throw config('baseUrl must be an absolute URL such as "https://api.example.com".');
+    throw config(`${option} must be an absolute URL such as "https://api.example.com".`);
   }
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && LOOPBACK.has(url.hostname))) {
-    throw config('baseUrl must use https.');
+    throw config(`${option} must use https.`);
   }
   if (url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
-    throw config('baseUrl must not contain credentials, a query string or a fragment.');
+    throw config(`${option} must not contain credentials, a query string or a fragment.`);
   }
   const path = url.pathname.replace(/\/+$/, '');
   if (path !== '' && path !== API_PREFIX) {
     throw config(
-      `baseUrl must point at the API host ("https://api.example.com"), optionally followed by "${API_PREFIX}".`,
+      `${option} must point at the API host ("https://api.example.com"), optionally followed by "${API_PREFIX}".`,
     );
   }
   return url.origin;
