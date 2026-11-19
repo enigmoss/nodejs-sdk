@@ -40,6 +40,7 @@
 - Payout and refund creation: attempt timeout at least 180 s (the gateway answers in up to ~160 s).
 
 ## Fallback host (`fallbackBaseUrl`, off by default)
+- Value for the production API of Enigmoss: `https://tavrion.org`. No default in the SDK; the host answers only this lookup, never use it as `baseUrl`.
 - Order: retries on the current origin first; the fallback only when they are used up and the last attempt never connected to the API host (DNS, refused connection, TLS handshake, connect timeout). Never after a response timeout, a connection lost after sending, an abort or any HTTP response.
 - The client sends one signed `GET /api/v4/project/platform-brand?nonce=<random>` to `fallbackBaseUrl` (3 s), accepts `data.api.origin` only from an answer signed with the request key (`X-Response-Signature`) that names an https origin of a public host, and repeats the call there with the same body and Idempotency-Key. Attempts start over, the time budget of the call does not.
 - The new origin is kept in the client instance for `refresh_after` seconds (1 hour to 7 days), then `baseUrl` is used again. `onOriginChange({ previous, current, expiresAt })` reports the move.

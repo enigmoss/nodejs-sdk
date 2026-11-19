@@ -13,6 +13,7 @@ All notable changes of the `enigmoss` package. The project follows semantic vers
   repeats the call on the new origin with the same body and Idempotency-Key. The origin is kept in
   the client instance for `refresh_after` seconds (1 hour to 7 days). An error of the fallback host
   is thrown with the network error as `cause`; a fallback that did not move the client is not
-  repeated for 5 minutes. Off unless the option is set.
+  repeated for 5 minutes. Off unless the option is set; the fallback host of the Enigmoss
+  production API is `https://tavrion.org`.
 - `onOriginChange` option and the `OriginChange` type: called when the client moves to another
   API origin.
