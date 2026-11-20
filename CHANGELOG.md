@@ -2,6 +2,10 @@
 
 All notable changes of the `enigmoss` package. The project follows semantic versioning.
 
+## 1.0.0
+
+Stable release of the Enigmoss Project API v4 SDK.
+
 ## 0.1.0 — unreleased
 
 - First release: client of the Project API v4 with all 34 operations, `request()` for any other
