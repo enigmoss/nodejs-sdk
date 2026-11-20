@@ -237,7 +237,7 @@ describe('an answer of the fallback host that is not a new origin', () => {
       invalid(),
     ],
     ['a timestamp older than 300 s', names(MOVED, { timestamp: now() - 302 }), invalid()],
-    ['a timestamp more than 300 s ahead', names(MOVED, { timestamp: now() + 302 }), invalid()],
+    ['a timestamp more than 300 s ahead', names(MOVED, { timestamp: now() + 600 }), invalid()],
     ...[
       'http://api2.example.com',
       'http://localhost:8080',

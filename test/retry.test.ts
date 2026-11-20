@@ -353,11 +353,16 @@ describe('timeouts and abort', () => {
   it('an aborted signal stops the call with an unknown outcome', async () => {
     const { fetch, sent } = fakeFetch([hang]);
     const controller = new AbortController();
-    const promise = client(fetch).payouts.create(
+    const enigmoss = client((input, init) => {
+      const response = fetch(input, init);
+      // The fake transport records the request and registers its abort listener synchronously.
+      controller.abort();
+      return response;
+    });
+    const promise = enigmoss.payouts.create(
       { order_id: 'w-7', amount: '25', currency_code: 'USDT', address: 'T1' },
       { signal: controller.signal },
     );
-    setTimeout(() => controller.abort(), 10);
     await expect(promise).rejects.toMatchObject({ code: 'aborted', outcomeUnknown: true });
     expect(sent).toHaveLength(1);
   });

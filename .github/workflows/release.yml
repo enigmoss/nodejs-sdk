@@ -24,8 +24,8 @@ jobs:
         run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run build
       - run: npm test
+      - run: sh test/check-package.sh
       - run: node test/smoke.mjs
       - run: npm publish --provenance --access public
         env:

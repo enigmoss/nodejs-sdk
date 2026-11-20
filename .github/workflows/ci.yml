@@ -25,17 +25,9 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run build
       - run: npm test
+      - run: sh test/check-package.sh
       - run: node test/smoke.mjs
-      - name: Package contents
-        run: |
-          npm pack --dry-run --json > pack.json
-          node -e '
-            const files = JSON.parse(require("fs").readFileSync("pack.json", "utf8"))[0].files.map((f) => f.path);
-            const bad = files.filter((f) => !/^(dist\/|README\.md$|llms\.txt$|LICENSE$|CHANGELOG\.md$|package\.json$)/.test(f));
-            if (bad.length) { console.error("unexpected files:", bad); process.exit(1); }
-          '
 
   bun:
     name: Bun smoke
